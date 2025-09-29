@@ -155,7 +155,7 @@ class Predictor(object):
             t0 = time.time()
             outputs = self.model(img)
             if self.decoder is not None:
-                outputs = self.decoder(outputs, dtype=outputs.type())
+                outputs = self.decoder(outputs, ref_tensor=img)
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre,
                 self.nmsthre, class_agnostic=True

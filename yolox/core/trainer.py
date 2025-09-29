@@ -19,9 +19,12 @@ from yolox.utils import (
     WandbLogger,
     adjust_status,
     all_reduce_norm,
+    autocast_context,
     get_local_rank,
     get_model_info,
     get_rank,
+    get_target_device,
+    get_target_device_type,
     get_world_size,
     gpu_mem_usage,
     is_parallel,
@@ -30,6 +33,7 @@ from yolox.utils import (
     occupy_mem,
     save_checkpoint,
     setup_logger,
+    supports_amp,
     synchronize
 )
 
@@ -43,17 +47,27 @@ class Trainer:
 
         # training related attr
         self.max_epoch = config.max_epoch
-        self.amp_training = args.fp16
-        self.scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+        self.device_type = get_target_device_type()
+        self.local_rank = get_local_rank()
+        self.device = (
+            torch.device(f"cuda:{self.local_rank}")
+            if self.device_type == "cuda"
+            else get_target_device()
+        )
+
+        self.amp_training = args.fp16 and supports_amp(self.device_type)
+        self.scaler = (
+            torch.cuda.amp.GradScaler(enabled=self.amp_training)
+            if self.device_type == "cuda"
+            else None
+        )
         self.is_distributed = get_world_size() > 1
         self.rank = get_rank()
-        self.local_rank = get_local_rank()
-        self.device = "cuda:{}".format(self.local_rank)
         self.use_model_ema = config.ema
         self.save_history_ckpt = config.save_history_ckpt
 
         # data/dataloader related attr
-        self.data_type = torch.float16 if args.fp16 else torch.float32
+        self.data_type = torch.float16 if self.amp_training else torch.float32
         self.input_size = config.input_size
         self.best_ap = 0
 
@@ -103,15 +117,19 @@ class Trainer:
         inps, targets = self.exp.preprocess(inps, targets, self.input_size)
         data_end_time = time.time()
 
-        with torch.cuda.amp.autocast(enabled=self.amp_training):
+        with autocast_context(self.device_type, self.amp_training):
             outputs = self.model(inps, targets)
 
         loss = outputs["total_loss"]
 
         self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
 
         if self.use_model_ema:
             self.ema_model.update(self.model)
@@ -133,7 +151,8 @@ class Trainer:
         logger.info("exp value:\n{}".format(self.exp))
 
         # model related init
-        torch.cuda.set_device(self.local_rank)
+        if self.device_type == "cuda":
+            torch.cuda.set_device(self.local_rank)
         model = self.exp.get_model()
         logger.info(
             "Model Summary: {}".format(get_model_info(model, self.exp.test_size))
@@ -155,14 +174,14 @@ class Trainer:
             cache_img=self.args.cache,
         )
         logger.info("init prefetcher, this might take one minute or less...")
-        self.prefetcher = DataPrefetcher(self.train_loader)
+        self.prefetcher = DataPrefetcher(self.train_loader, self.device)
         # max_iter means iters per epoch
         self.max_iter = len(self.train_loader)
 
         self.lr_scheduler = self.exp.get_lr_scheduler(
             self.exp.basic_lr_per_img * self.args.batch_size, self.max_iter
         )
-        if self.args.occupy:
+        if self.device_type == "cuda" and self.args.occupy:
             occupy_mem(self.local_rank)
 
         if self.is_distributed:

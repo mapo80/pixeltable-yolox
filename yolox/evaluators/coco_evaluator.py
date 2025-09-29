@@ -130,7 +130,8 @@ class CocoEvaluator:
             summary (sr): summary info of evaluation.
         """
         # TODO half to amp_test
-        tensor_type = torch.cuda.HalfTensor if half else torch.cuda.FloatTensor
+        device = next(model.parameters()).device
+        half = half and device.type == "cuda"
         model = model.eval()
         if half:
             model = model.half()
@@ -149,7 +150,10 @@ class CocoEvaluator:
             model_trt = TRTModule()
             model_trt.load_state_dict(torch.load(trt_file))
 
-            x = torch.ones(1, 3, test_size[0], test_size[1]).cuda()
+            if device.type != "cuda":
+                raise RuntimeError("TensorRT execution is only supported with CUDA devices.")
+
+            x = torch.ones(1, 3, test_size[0], test_size[1]).to(device)
             model(x)
             model = model_trt
 
@@ -157,7 +161,7 @@ class CocoEvaluator:
             progress_bar(self.dataloader)
         ):
             with torch.no_grad():
-                imgs = imgs.type(tensor_type)
+                imgs = imgs.to(device, non_blocking=device.type == "cuda")
 
                 # skip the last iters since batchsize might be not enough for batch inference
                 is_time_record = cur_iter < len(self.dataloader) - 1
@@ -166,7 +170,7 @@ class CocoEvaluator:
 
                 outputs = model(imgs)
                 if decoder is not None:
-                    outputs = decoder(outputs, dtype=outputs.type())
+                    outputs = decoder(outputs, ref_tensor=imgs)
 
                 if is_time_record:
                     infer_end = time_synchronized()
@@ -184,7 +188,8 @@ class CocoEvaluator:
             data_list.extend(data_list_elem)
             output_data.update(image_wise_data)
 
-        statistics = torch.cuda.FloatTensor([inference_time, nms_time, n_samples])
+        stats_device = torch.device("cuda") if device.type == "cuda" else torch.device("cpu")
+        statistics = torch.tensor([inference_time, nms_time, n_samples], device=stats_device)
         if distributed:
             # different process/device might have different speed,
             # to make sure the process will not be stucked, sync func is used here.

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from yolox.utils import bboxes_iou, cxcywh2xyxy, meshgrid, visualize_assign
+from yolox.utils import autocast_context, bboxes_iou, cxcywh2xyxy, meshgrid, visualize_assign
 
 from .losses import IouLoss
 from .network_blocks import BaseConv, DWConv
@@ -161,7 +161,7 @@ class YoloxHead(nn.Module):
             if self.training:
                 output = torch.cat([reg_output, obj_output, cls_output], 1)
                 output, grid = self.get_output_and_grid(
-                    output, k, stride_this_level, xin[0].type()
+                    output, k, stride_this_level, xin[0]
                 )
                 x_shifts.append(grid[:, :, 0])
                 y_shifts.append(grid[:, :, 1])
@@ -206,11 +206,11 @@ class YoloxHead(nn.Module):
                 [x.flatten(start_dim=2) for x in outputs], dim=2
             ).permute(0, 2, 1)
             if self.decode_in_inference:
-                return self.decode_outputs(outputs, dtype=xin[0].type())
+                return self.decode_outputs(outputs, ref_tensor=xin[0])
             else:
                 return outputs
 
-    def get_output_and_grid(self, output, k, stride, dtype):
+    def get_output_and_grid(self, output, k, stride, ref_tensor):
         grid = self.grids[k]
 
         batch_size = output.shape[0]
@@ -218,7 +218,11 @@ class YoloxHead(nn.Module):
         hsize, wsize = output.shape[-2:]
         if grid.shape[2:4] != output.shape[2:4]:
             yv, xv = meshgrid([torch.arange(hsize), torch.arange(wsize)])
-            grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2).type(dtype)
+            grid = (
+                torch.stack((xv, yv), 2)
+                .view(1, 1, hsize, wsize, 2)
+                .to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+            )
             self.grids[k] = grid
 
         output = output.view(batch_size, 1, n_ch, hsize, wsize)
@@ -230,7 +234,7 @@ class YoloxHead(nn.Module):
         output[..., 2:4] = torch.exp(output[..., 2:4]) * stride
         return output, grid
 
-    def decode_outputs(self, outputs, dtype):
+    def decode_outputs(self, outputs, ref_tensor):
         grids = []
         strides = []
         for (hsize, wsize), stride in zip(self.hw, self.strides):
@@ -240,8 +244,8 @@ class YoloxHead(nn.Module):
             shape = grid.shape[:2]
             strides.append(torch.full((*shape, 1), stride))
 
-        grids = torch.cat(grids, dim=1).type(dtype)
-        strides = torch.cat(strides, dim=1).type(dtype)
+        grids = torch.cat(grids, dim=1).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        strides = torch.cat(strides, dim=1).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
 
         outputs = torch.cat([
             (outputs[..., 0:2] + grids) * strides,
@@ -327,7 +331,8 @@ class YoloxHead(nn.Module):
                            CPU mode is applied in this batch. If you want to avoid this issue, \
                            try to reduce the batch size or image size."
                     )
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     (
                         gt_matched_classes,
                         fg_mask,
@@ -348,7 +353,8 @@ class YoloxHead(nn.Module):
                         "cpu",
                     )
 
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 num_fg += num_fg_img
 
                 cls_target = F.one_hot(
@@ -433,6 +439,8 @@ class YoloxHead(nn.Module):
         mode="gpu",
     ):
 
+        original_device = cls_preds.device
+
         if mode == "cpu":
             print("-----------Using CPU for the Current Batch-------------")
             gt_bboxes_per_image = gt_bboxes_per_image.cpu().float()
@@ -469,7 +477,7 @@ class YoloxHead(nn.Module):
         if mode == "cpu":
             cls_preds_, obj_preds_ = cls_preds_.cpu(), obj_preds_.cpu()
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with autocast_context(cls_preds_.device.type, False):
             cls_preds_ = (
                 cls_preds_.float().sigmoid_() * obj_preds_.float().sigmoid_()
             ).sqrt()
@@ -495,10 +503,10 @@ class YoloxHead(nn.Module):
         del pair_wise_cls_loss, cost, pair_wise_ious, pair_wise_ious_loss
 
         if mode == "cpu":
-            gt_matched_classes = gt_matched_classes.cuda()
-            fg_mask = fg_mask.cuda()
-            pred_ious_this_matching = pred_ious_this_matching.cuda()
-            matched_gt_inds = matched_gt_inds.cuda()
+            gt_matched_classes = gt_matched_classes.to(original_device)
+            fg_mask = fg_mask.to(original_device)
+            pred_ious_this_matching = pred_ious_this_matching.to(original_device)
+            matched_gt_inds = matched_gt_inds.to(original_device)
 
         return (
             gt_matched_classes,
@@ -592,7 +600,7 @@ class YoloxHead(nn.Module):
             obj_output = self.obj_preds[k](reg_feat)
 
             output = torch.cat([reg_output, obj_output, cls_output], 1)
-            output, grid = self.get_output_and_grid(output, k, stride_this_level, xin[0].type())
+            output, grid = self.get_output_and_grid(output, k, stride_this_level, xin[0])
             x_shifts.append(grid[:, :, 0])
             y_shifts.append(grid[:, :, 1])
             expanded_strides.append(

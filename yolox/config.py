@@ -273,7 +273,11 @@ class YoloxConfig:
         return train_loader
 
     def random_resize(self, data_loader, epoch, rank, is_distributed):
-        tensor = torch.LongTensor(2).cuda()
+        if hasattr(self, "model") and self.model is not None:
+            device = next(self.model.parameters()).device
+        else:
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        tensor = torch.zeros(2, dtype=torch.long, device=device)
 
         if rank == 0:
             size_factor = self.input_size[1] * 1.0 / self.input_size[0]

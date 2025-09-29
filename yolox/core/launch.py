@@ -12,6 +12,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import yolox.utils.dist as comm
+from yolox.utils import get_target_device_type
 
 __all__ = ["launch"]
 
@@ -54,6 +55,16 @@ def launch(
                        Can be set to auto to automatically select a free port on localhost
         args (tuple): arguments passed to main_func
     """
+    device_type = get_target_device_type()
+    if device_type != "cuda":
+        if num_gpus_per_machine != 1:
+            logger.warning(
+                "Overriding devices={} for {} execution; using a single process instead.",
+                num_gpus_per_machine,
+                device_type,
+            )
+        num_gpus_per_machine = 1
+
     world_size = num_machines * num_gpus_per_machine
     if world_size > 1:
         # https://github.com/pytorch/pytorch/pull/14391
@@ -78,7 +89,7 @@ def launch(
             start_method = "fork"
 
         mp.start_processes(
-            _distributed_worker,
+        _distributed_worker,
             nprocs=num_gpus_per_machine,
             args=(
                 main_func,
@@ -107,9 +118,9 @@ def _distributed_worker(
     args,
     timeout=DEFAULT_TIMEOUT,
 ):
-    assert (
-        torch.cuda.is_available()
-    ), "cuda is not available. Please check your installation."
+    device_type = get_target_device_type()
+    if device_type == "cuda":
+        assert torch.cuda.is_available(), "cuda is not available. Please check your installation."
     global_rank = machine_rank * num_gpus_per_machine + local_rank
     logger.info("Rank {} initialization finished.".format(global_rank))
     try:
@@ -139,7 +150,8 @@ def _distributed_worker(
     # See: https://github.com/facebookresearch/maskrcnn-benchmark/issues/172
     comm.synchronize()
 
-    assert num_gpus_per_machine <= torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
+    if device_type == "cuda":
+        assert num_gpus_per_machine <= torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
 
     main_func(*args)

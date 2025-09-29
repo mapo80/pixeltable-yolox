@@ -13,7 +13,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from yolox.config import YoloxConfig
 from yolox.core import launch
-from yolox.utils import configure_module, configure_nccl, fuse_model, get_local_rank, get_model_info, setup_logger
+from yolox.utils import (
+    configure_module,
+    configure_nccl,
+    fuse_model,
+    get_local_rank,
+    get_model_info,
+    get_num_devices,
+    get_target_device,
+    get_target_device_type,
+    setup_logger,
+)
 
 from .utils import parse_model_config_opts, resolve_config
 
@@ -100,24 +110,35 @@ def make_parser():
     return parser
 
 
-def eval(config: YoloxConfig, args, num_gpu):
+def eval(config: YoloxConfig, args, num_devices):
+    device_type = get_target_device_type()
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
-        cudnn.deterministic = True
-        warnings.warn(
-            "You have chosen to seed training. This will turn on the CUDNN deterministic setting, "
-            "which can slow down your training considerably! You may see unexpected behavior "
-            "when restarting from checkpoints."
-        )
+        if device_type == "cuda":
+            cudnn.deterministic = True
+            warnings.warn(
+                "You have chosen to seed training. This will turn on the CUDNN deterministic setting, "
+                "which can slow down your training considerably! You may see unexpected behavior "
+                "when restarting from checkpoints."
+            )
 
-    is_distributed = num_gpu > 1
+    if device_type != "cuda" and args.fp16:
+        logger.warning("Disabling --fp16: only supported with CUDA devices.")
+        args.fp16 = False
+
+    if device_type != "cuda" and args.trt:
+        raise RuntimeError("TensorRT evaluation is only supported with CUDA devices.")
+
+    is_distributed = num_devices > 1
 
     # set environment variables for distributed training
-    configure_nccl()
-    cudnn.benchmark = True
+    if device_type == "cuda":
+        configure_nccl()
+        cudnn.benchmark = True
 
     rank = get_local_rank()
+    device = get_target_device()
 
     file_name = os.path.join(config.output_dir, args.experiment_name)
 
@@ -142,8 +163,11 @@ def eval(config: YoloxConfig, args, num_gpu):
     evaluator.per_class_AP = True
     evaluator.per_class_AR = True
 
-    torch.cuda.set_device(rank)
-    model.cuda(rank)
+    if device_type == "cuda":
+        torch.cuda.set_device(rank)
+        model = model.cuda(rank)
+    else:
+        model = model.to(device)
     model.eval()
 
     if not args.speed and not args.trt:
@@ -152,13 +176,14 @@ def eval(config: YoloxConfig, args, num_gpu):
         else:
             ckpt_file = args.ckpt
         logger.info("loading checkpoint from {}".format(ckpt_file))
-        loc = "cuda:{}".format(rank)
-        ckpt = torch.load(ckpt_file, map_location=loc)
+        map_location = torch.device(f"cuda:{rank}") if device_type == "cuda" else device
+        ckpt = torch.load(ckpt_file, map_location=map_location)
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
 
     if is_distributed:
-        model = DDP(model, device_ids=[rank])
+        ddp_kwargs = {"device_ids": [rank]} if device_type == "cuda" else {}
+        model = DDP(model, **ddp_kwargs)
 
     if args.fuse:
         logger.info("\tFusing model...")
@@ -197,18 +222,22 @@ def main(argv: list[str]) -> None:
     if not args.name:
         args.name = config.name
 
-    num_gpu = torch.cuda.device_count() if args.devices is None else args.devices
-    assert num_gpu <= torch.cuda.device_count()
+    device_type = get_target_device_type()
+    if device_type != "cuda" and args.dist_backend == "nccl":
+        args.dist_backend = "gloo"
+
+    num_devices = get_num_devices() if args.devices is None else args.devices
+    assert num_devices <= get_num_devices()
 
     dist_url = "auto" if args.dist_url is None else args.dist_url
     launch(
         eval,
-        num_gpu,
+        num_devices,
         args.num_machines,
         args.machine_rank,
         backend=args.dist_backend,
         dist_url=dist_url,
-        args=(config, args, num_gpu),
+        args=(config, args, num_devices),
     )
 
 if __name__ == "__main__":

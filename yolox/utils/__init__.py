@@ -6,6 +6,7 @@ from .checkpoint import load_ckpt, save_checkpoint
 from .compat import meshgrid
 from .demo_utils import *
 from .dist import *
+from .device import *
 from .ema import *
 from .logger import WandbLogger, setup_logger
 from .lr_scheduler import LRScheduler

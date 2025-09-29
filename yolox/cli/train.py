@@ -11,7 +11,13 @@ from torch.backends import cudnn
 
 from yolox.config import YoloxConfig
 from yolox.core import launch
-from yolox.utils import configure_module, configure_nccl, configure_omp, get_num_devices
+from yolox.utils import (
+    configure_module,
+    configure_nccl,
+    configure_omp,
+    get_num_devices,
+    get_target_device_type,
+)
 
 from .utils import parse_model_config_opts, resolve_config
 
@@ -93,21 +99,25 @@ def make_parser():
 
 
 def train(config: YoloxConfig, args):
+    device_type = get_target_device_type()
     if config.seed is not None:
         assert isinstance(config.seed, int)
         random.seed(config.seed)
         torch.manual_seed(config.seed)
-        cudnn.deterministic = True
-        warnings.warn(
-            "You have chosen to seed training. This will turn on the CUDNN deterministic setting, "
-            "which can slow down your training considerably! You may see unexpected behavior "
-            "when restarting from checkpoints."
-        )
+        if device_type == "cuda":
+            cudnn.deterministic = True
+            warnings.warn(
+                "You have chosen to seed training. This will turn on the CUDNN deterministic setting, "
+                "which can slow down your training considerably! You may see unexpected behavior "
+                "when restarting from checkpoints."
+            )
 
     # set environment variables for distributed training
-    configure_nccl()
+    if device_type == "cuda":
+        configure_nccl()
     configure_omp()
-    cudnn.benchmark = True
+    if device_type == "cuda":
+        cudnn.benchmark = True
 
     trainer = config.get_trainer(args)
     trainer.train()
@@ -125,8 +135,16 @@ def main(argv: list[str]) -> None:
     if not args.name:
         args.name = config.name
 
-    num_gpu = get_num_devices() if args.devices is None else args.devices
-    assert num_gpu <= get_num_devices()
+    device_type = get_target_device_type()
+    if device_type != "cuda" and args.fp16:
+        logger.warning("Disabling --fp16: only supported with CUDA devices.")
+        args.fp16 = False
+
+    if device_type != "cuda" and args.dist_backend == "nccl":
+        args.dist_backend = "gloo"
+
+    num_devices = get_num_devices() if args.devices is None else args.devices
+    assert num_devices <= get_num_devices()
 
     if args.cache is not None:
         config.dataset = config.get_dataset(cache=True, cache_type=args.cache)
@@ -134,7 +152,7 @@ def main(argv: list[str]) -> None:
     dist_url = "auto" if args.dist_url is None else args.dist_url
     launch(
         train,
-        num_gpu,
+        num_devices,
         args.num_machines,
         args.machine_rank,
         backend=args.dist_backend,

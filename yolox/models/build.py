@@ -2,6 +2,8 @@ import torch
 from torch import nn
 from torch.hub import load_state_dict_from_url
 
+from yolox.utils import get_target_device
+
 __all__ = [
     "create_yolox_model",
     "yolox_nano",
@@ -47,8 +49,9 @@ def create_yolox_model(name: str, pretrained: bool = True, num_classes: int = 80
     from yolox.exp import get_exp, Exp
 
     if device is None:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device)
+        device = get_target_device()
+    else:
+        device = torch.device(device)
 
     assert name in _CKPT_FULL_PATH or name == "yolox_custom", \
         f"user should use one of value in {_CKPT_FULL_PATH.keys()} or \"yolox_custom\""

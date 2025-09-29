@@ -12,7 +12,12 @@ import torch.backends.cudnn as cudnn
 
 from yolox.exp import Exp, get_exp
 from yolox.core import Trainer
-from yolox.utils import configure_module, configure_omp
+from yolox.utils import (
+    autocast_context,
+    configure_module,
+    configure_omp,
+    get_target_device_type,
+)
 from yolox.tools.train import make_parser
 
 
@@ -34,7 +39,7 @@ class AssignVisualizer(Trainer):
         inps, targets = self.exp.preprocess(inps, targets, self.input_size)
         data_end_time = time.time()
 
-        with torch.cuda.amp.autocast(enabled=self.amp_training):
+        with autocast_context(self.device_type, self.amp_training):
             path_prefix = os.path.join(self.vis_dir, f"assign_vis_{self.batch_cnt}_")
             self.model.visualize(inps, targets, path_prefix)
 
@@ -65,16 +70,18 @@ def main(exp: Exp, args):
     if exp.seed is not None:
         random.seed(exp.seed)
         torch.manual_seed(exp.seed)
-        cudnn.deterministic = True
-        warnings.warn(
-            "You have chosen to seed training. This will turn on the CUDNN deterministic setting, "
-            "which can slow down your training considerably! You may see unexpected behavior "
-            "when restarting from checkpoints."
-        )
+        if get_target_device_type() == "cuda":
+            cudnn.deterministic = True
+            warnings.warn(
+                "You have chosen to seed training. This will turn on the CUDNN deterministic setting, "
+                "which can slow down your training considerably! You may see unexpected behavior "
+                "when restarting from checkpoints."
+            )
 
     # set environment variables for distributed training
     configure_omp()
-    cudnn.benchmark = True
+    if get_target_device_type() == "cuda":
+        cudnn.benchmark = True
 
     visualizer = AssignVisualizer(exp, args)
     visualizer.train()

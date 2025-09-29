@@ -25,7 +25,8 @@ class IouLoss(nn.Module):
         area_p = torch.prod(pred[:, 2:], 1)
         area_g = torch.prod(target[:, 2:], 1)
 
-        en = (tl < br).type(tl.type()).prod(dim=1)
+        en = (tl < br).to(tl)
+        en = en.prod(dim=1)
         area_i = torch.prod(br - tl, 1) * en
         area_u = area_p + area_g - area_i
         iou = (area_i) / (area_u + 1e-16)

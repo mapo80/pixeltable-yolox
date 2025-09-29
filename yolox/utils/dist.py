@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch import distributed as dist
 
+from .device import get_target_device_type
+
 __all__ = [
     "get_num_devices",
     "wait_for_the_master",
@@ -37,13 +39,22 @@ _LOCAL_PROCESS_GROUP = None
 
 
 def get_num_devices():
-    gpu_list = os.getenv('CUDA_VISIBLE_DEVICES', None)
-    if gpu_list is not None:
-        return len(gpu_list.split(','))
-    else:
+    device_type = get_target_device_type()
+    if device_type != "cuda":
+        return 1
+
+    gpu_list = os.getenv("CUDA_VISIBLE_DEVICES", None)
+    if gpu_list:
+        return len([gpu for gpu in gpu_list.split(",") if gpu.strip()])
+
+    try:
         devices_list_info = os.popen("nvidia-smi -L")
-        devices_list_info = devices_list_info.read().strip().split("\n")
-        return len(devices_list_info)
+        output = devices_list_info.read().strip()
+    except FileNotFoundError:
+        output = ""
+    if not output:
+        return torch.cuda.device_count()
+    return len([line for line in output.split("\n") if line.strip()])
 
 
 @contextmanager
@@ -287,6 +298,9 @@ def shared_random_seed():
 
 def time_synchronized():
     """pytorch-accurate time"""
-    if torch.cuda.is_available():
+    device_type = get_target_device_type()
+    if device_type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
+    elif device_type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
     return time.time()
